@@ -1,0 +1,387 @@
+"""
+Tournament-Optimized Answer Agent - Qwen3-4B with Unsloth
+Enhanced version with:
+1. ✅ Unsloth FastLanguageModel for GPU optimization
+2. ✅ Dynamic prompt tuning for question difficulty
+3. ✅ Comprehensive logging and failure tracking
+4. ✅ AMD GPU fallback support
+5. ✅ Cache path fixed for read-only systems
+6. ✅ Increased token limits for complex reasoning
+7. ✅ End-to-end testing compatibility
+"""
+
+import os
+import json
+import time
+import torch
+import re
+import random
+import logging
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
+# === FIX HUGGINGFACE / UNSLOTH CACHE PATH ===
+custom_cache_dir = os.path.expanduser("~/.hf_cache")  # writable cache folder
+os.makedirs(custom_cache_dir, exist_ok=True)
+os.environ['HF_HOME'] = custom_cache_dir
+os.environ['TRANSFORMERS_CACHE'] = custom_cache_dir
+os.environ['XDG_CACHE_HOME'] = custom_cache_dir
+print(f"✅ HuggingFace & Transformers cache redirected to: {custom_cache_dir}")
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('answer_agent.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Deterministic seeding
+torch.random.manual_seed(0)
+random.seed(0)
+
+CHAT_TEMPLATE = """<|im_start|>system
+{system_prompt}<|im_end|>
+<|im_start|>user
+{instruction}<|im_end|>
+<|im_start|>assistant
+"""
+
+
+class AAgent:
+    """Answer Agent - Tournament-Optimized with Qwen3-4B + Unsloth"""
+
+    def __init__(self, use_unsloth: bool = True, **kwargs):
+        """
+        Initialize Answer Agent with Qwen3-4B
+
+        Args:
+            use_unsloth: Use Unsloth FastLanguageModel (recommended for speed)
+            **kwargs: Additional configuration options
+        """
+        self.max_seq_length = kwargs.get('max_seq_length', 2048)
+        self.use_unsloth = use_unsloth
+        load_in_4bit = kwargs.get('load_in_4bit', True)
+
+        # Failure tracking
+        self.failure_log = []
+        self.strategy_stats = {
+            'step_by_step': {'success': 0, 'fail': 0},
+            'elimination': {'success': 0, 'fail': 0},
+            'direct': {'success': 0, 'fail': 0}
+        }
+
+        # AMD + Unsloth fallback handling
+        model_name = "unsloth/Qwen3-4B-bnb-4bit" if use_unsloth else "Qwen/Qwen3-4B"
+
+        logger.info(f"Loading {model_name}...")
+        logger.info(f"Using Unsloth: {use_unsloth}")
+        logger.info(f"4-bit quantization: {load_in_4bit}")
+
+        try:
+            if use_unsloth:
+                self._load_with_unsloth(model_name, load_in_4bit, kwargs)
+            else:
+                self._load_with_transformers(model_name, load_in_4bit, kwargs)
+
+            logger.info("✓ Model loaded and optimized")
+            logger.info("✓ Deterministic seeding enabled")
+
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            if use_unsloth and torch.cuda.is_available() and "AMD" in torch.cuda.get_device_name(0):
+                logger.warning("AMD GPU detected, falling back to Transformers...")
+                self._load_with_transformers("Qwen/Qwen3-4B", load_in_4bit, kwargs)
+            else:
+                raise
+
+    def _load_with_unsloth(self, model_name: str, load_in_4bit: bool, kwargs: dict):
+        """Load model using Unsloth FastLanguageModel"""
+        try:
+            from unsloth import FastLanguageModel
+
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_name,
+                max_seq_length=self.max_seq_length,
+                dtype=None,  # Auto-detect
+                load_in_4bit=load_in_4bit,
+            )
+
+            # Enable native 2x faster inference
+            FastLanguageModel.for_inference(self.model)
+            logger.info("✓ Unsloth FastLanguageModel loaded with 2x inference speedup")
+
+        except ImportError:
+            logger.warning("Unsloth not installed, falling back to Transformers")
+            self.use_unsloth = False
+            self._load_with_transformers("Qwen/Qwen3-4B", load_in_4bit, kwargs)
+        except Exception as e:
+            logger.error(f"Unsloth loading failed: {e}")
+            logger.warning("Falling back to Transformers")
+            self.use_unsloth = False
+            self._load_with_transformers("Qwen/Qwen3-4B", load_in_4bit, kwargs)
+
+    def _load_with_transformers(self, model_name: str, load_in_4bit: bool, kwargs: dict):
+        """Load model using Transformers (fallback)"""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            padding_side="left",
+            trust_remote_code=True
+        )
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True
+        )
+
+        self.model.eval()
+        logger.info("✓ Model loaded via Transformers")
+
+    # --- QUESTION DIFFICULTY ASSESSMENT ---
+    def _assess_question_difficulty(self, question_dict: Dict[str, Any]) -> str:
+        question = question_dict.get('question', '')
+        complexity_keywords = {
+            'complex': ['paradox', 'contradiction', 'all of the above', 'none of the above',
+                        'except', 'cannot', 'least likely', 'most likely'],
+            'medium': ['therefore', 'because', 'if', 'then', 'must', 'always', 'never'],
+            'simple': ['is', 'are', 'what', 'which', 'who']
+        }
+
+        question_lower = question.lower()
+
+        if any(kw in question_lower for kw in complexity_keywords['complex']) or len(question) > 100:
+            return 'complex'
+        if any(kw in question_lower for kw in complexity_keywords['medium']):
+            return 'medium'
+        return 'simple'
+
+    # --- PROMPT BUILDERS ---
+    def build_step_by_step_prompt(self, question_dict: Dict[str, Any]) -> str:
+        choices_text = "\n".join(question_dict['choices'])
+        difficulty = self._assess_question_difficulty(question_dict)
+
+        if difficulty == 'complex':
+            reasoning_guide = """DETAILED REASONING STEPS:
+1. List ALL facts, conditions, and constraints
+2. Check for hidden assumptions
+3. Deduce logically
+4. Evaluate EACH option
+5. Eliminate violating options
+6. Select logically consistent option"""
+        elif difficulty == 'medium':
+            reasoning_guide = """REASONING STEPS:
+1. List facts
+2. Deduce consequences
+3. Check options for consistency
+4. Select correct option"""
+        else:
+            reasoning_guide = """STEPS:
+1. Understand the question
+2. Apply given info
+3. Choose correct option"""
+
+        instruction = f"""Answer this question with careful reasoning.
+
+Question: {question_dict['question']}
+
+Options:
+{choices_text}
+
+{reasoning_guide}
+
+Provide ONLY this JSON format:
+{{"answer": "X"}}"""
+        return instruction
+
+    def build_elimination_prompt(self, question_dict: Dict[str, Any]) -> str:
+        choices_text = "\n".join(question_dict['choices'])
+        difficulty = self._assess_question_difficulty(question_dict)
+
+        if difficulty == 'complex':
+            elimination_guide = """SYSTEMATIC ELIMINATION:
+For EACH option A-D:
+- Does it satisfy all conditions?
+- Any contradictions?
+- Does it handle edge cases?
+Eliminate failing options. Remaining is correct."""
+        else:
+            elimination_guide = """ELIMINATION PROCESS:
+Check each option, eliminate contradicting options. Remaining is correct."""
+
+        instruction = f"""Answer by eliminating incorrect options.
+
+Question: {question_dict['question']}
+
+Options:
+{choices_text}
+
+{elimination_guide}
+
+Provide ONLY this JSON format:
+{{"answer": "X"}}"""
+        return instruction
+
+    def build_direct_prompt(self, question_dict: Dict[str, Any]) -> str:
+        choices_text = "\n".join(question_dict['choices'])
+        instruction = f"""Question: {question_dict['question']}
+
+Options:
+{choices_text}
+
+Answer ONLY in JSON:
+{{"answer": "X"}}"""
+        return instruction
+
+    # --- GENERATION ---
+    def generate_response(self, message: str | List[str], system_prompt: Optional[str] = None, **kwargs) -> tuple:
+        if system_prompt is None:
+            system_prompt = "You are a logical reasoning expert. Return ONLY valid JSON."
+
+        if isinstance(message, str):
+            message = [message]
+
+        texts = [CHAT_TEMPLATE.format(system_prompt=system_prompt, instruction=msg) for msg in message]
+
+        model_inputs = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length
+        ).to(self.model.device)
+
+        max_new_tokens = kwargs.get('max_new_tokens', 256)
+
+        try:
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            return [""] * len(message), None, None
+
+        batch_outs = []
+        for input_ids, generated_sequence in zip(model_inputs.input_ids, generated_ids):
+            output_ids = generated_sequence[len(input_ids):]
+            content = self.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+            batch_outs.append(content)
+
+        return batch_outs[0] if len(batch_outs) == 1 else batch_outs, None, None
+
+    # --- ANSWERING STRATEGIES ---
+    def _parse_and_validate_answer(self, response: str) -> Optional[Dict[str, Any]]:
+        if not response:
+            return None
+        # Try JSON parse
+        for method in range(3):
+            try:
+                if method == 0:
+                    answer_dict = json.loads(response)
+                elif method == 1:
+                    start, end = response.find('{'), response.rfind('}')
+                    answer_dict = json.loads(response[start:end + 1])
+                else:
+                    import re
+                    json_match = re.search(r'\{[^}]*"answer"[^}]*\}', response)
+                    answer_dict = json.loads(json_match.group())
+                if 'answer' in answer_dict:
+                    ans = str(answer_dict['answer']).strip().upper()
+                    if ans in 'ABCD':
+                        return {"answer": ans}
+            except:
+                continue
+        # Last resort, any A-D
+        match = re.search(r'\b[A-D]\b', response.upper())
+        if match:
+            return {"answer": match.group(0)}
+        return None
+
+    def _log_failure(self, question: Dict[str, Any], strategy: str, response: str):
+        failure_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'question_id': question.get('id', 'unknown'),
+            'question': question.get('question', ''),
+            'strategy': strategy,
+            'response': response[:200],
+        }
+        self.failure_log.append(failure_entry)
+        logger.debug(f"Logged failure for Q{question.get('id', 'unknown')} - {strategy}")
+
+    def answer_question(self, question_dict: Dict[str, Any], **kwargs) -> Optional[Dict[str, Any]]:
+        strategies = [
+            ('step_by_step', self.build_step_by_step_prompt),
+            ('elimination', self.build_elimination_prompt),
+            ('direct', self.build_direct_prompt)
+        ]
+        for strategy_name, builder in strategies:
+            instruction = builder(question_dict)
+            response, _, _ = self.generate_response(instruction, **kwargs)
+            answer = self._parse_and_validate_answer(response)
+            if answer:
+                self.strategy_stats[strategy_name]['success'] += 1
+                return answer
+            else:
+                self.strategy_stats[strategy_name]['fail'] += 1
+                self._log_failure(question_dict, strategy_name, response)
+        return None
+
+    def answer_batch_questions(self, questions: List[Dict[str, Any]], **kwargs) -> List[Optional[Dict[str, Any]]]:
+        answers = []
+        for q in questions:
+            ans = self.answer_question(q, **kwargs)
+            answers.append(ans)
+        return answers
+
+    def save_failure_log(self, filepath: str = "failures.json"):
+        with open(filepath, 'w') as f:
+            json.dump(self.failure_log, f, indent=2)
+        logger.info(f"Failure log saved to {filepath}")
+
+    def print_stats(self):
+        print("\n" + "=" * 70)
+        print("STRATEGY STATISTICS")
+        print("=" * 70)
+        for s, stats in self.strategy_stats.items():
+            total = stats['success'] + stats['fail']
+            if total > 0:
+                rate = stats['success'] / total * 100
+                print(f"{s.upper()}: Success {stats['success']}/{total} ({rate:.1f}%), Fail {stats['fail']}")
+        print(f"Total failures logged: {len(self.failure_log)}")
+        print("=" * 70)
+
+
+# === TEST & DEMO ===
+if __name__ == "__main__":
+    print("="*70)
+    print("✅ ANSWER AGENT READY - UNSLOTH + AMD + FIXED CACHE")
+    print("="*70)
+
+    agent = AAgent(use_unsloth=True, load_in_4bit=True)
+
+    sample_question = {
+        "id": "test_001",
+        "topic": "Logical Reasoning: Syllogisms",
+        "question": "All humans are mortal. Socrates is human. Therefore, what must be true?",
+        "choices": [
+            "A) Socrates is immortal",
+            "B) Socrates must be mortal",
+            "C) Some mortals are human",
+            "D) All mortals are Socrates"
+        ]
+    }
+
+    answer = agent.answer_question(sample_question)
+    print(f"Answer: {answer['answer'] if answer else 'None'}")
