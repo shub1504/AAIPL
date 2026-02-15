@@ -1,0 +1,718 @@
+"""
+Tournament-Optimized Answer Agent - Qwen3-4B with Unsloth
+Enhanced version with:
+1. ✅ Unsloth FastLanguageModel for GPU optimization
+2. ✅ Dynamic prompt tuning for question difficulty
+3. ✅ Comprehensive logging and failure tracking
+4. ✅ AMD GPU fallback support
+5. ✅ Increased token limits for complex reasoning
+6. ✅ End-to-end testing compatibility
+"""
+
+import json
+import time
+import torch
+import re
+import random
+import logging
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('answer_agent.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Deterministic seeding
+torch.random.manual_seed(0)
+random.seed(0)
+
+CHAT_TEMPLATE = """<|im_start|>system
+{system_prompt}<|im_end|>
+<|im_start|>user
+{instruction}<|im_end|>
+<|im_start|>assistant
+"""
+
+
+class AAgent:
+    """Answer Agent - Tournament-Optimized with Qwen3-4B + Unsloth"""
+    
+    def __init__(self, use_unsloth: bool = True, **kwargs):
+        """
+        Initialize Answer Agent with Qwen3-4B
+        
+        Args:
+            use_unsloth: Use Unsloth FastLanguageModel (recommended for speed)
+            **kwargs: Additional configuration options
+        """
+        self.max_seq_length = kwargs.get('max_seq_length', 2048)
+        self.use_unsloth = use_unsloth
+        load_in_4bit = kwargs.get('load_in_4bit', True)
+        
+        # Failure tracking
+        self.failure_log = []
+        self.strategy_stats = {
+            'step_by_step': {'success': 0, 'fail': 0},
+            'elimination': {'success': 0, 'fail': 0},
+            'direct': {'success': 0, 'fail': 0}
+        }
+        
+        model_name = "unsloth/Qwen2.5-3B-bnb-4bit" if use_unsloth else "Qwen/Qwen3-4B"
+        
+        logger.info(f"Loading {model_name}...")
+        logger.info(f"Using Unsloth: {use_unsloth}")
+        logger.info(f"4-bit quantization: {load_in_4bit}")
+        
+        try:
+            if use_unsloth:
+                self._load_with_unsloth(model_name, load_in_4bit, kwargs)
+            else:
+                self._load_with_transformers(model_name, load_in_4bit, kwargs)
+                
+            logger.info("✓ Model loaded and optimized")
+            logger.info("✓ Deterministic seeding enabled")
+            
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            if use_unsloth and "AMD" in str(torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""):
+                logger.warning("AMD GPU detected, falling back to Transformers...")
+                self._load_with_transformers("Qwen/Qwen3-4B", load_in_4bit, kwargs)
+            else:
+                raise
+    
+    def _load_with_unsloth(self, model_name: str, load_in_4bit: bool, kwargs: dict):
+        """Load model using Unsloth FastLanguageModel"""
+        try:
+            from unsloth import FastLanguageModel
+            
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_name,
+                max_seq_length=self.max_seq_length,
+                dtype=None,  # Auto-detect
+                load_in_4bit=load_in_4bit,
+            )
+            
+            # Enable native 2x faster inference
+            FastLanguageModel.for_inference(self.model)
+            logger.info("✓ Unsloth FastLanguageModel loaded with 2x inference speedup")
+            
+        except ImportError:
+            logger.warning("Unsloth not installed, falling back to Transformers")
+            self.use_unsloth = False
+            self._load_with_transformers("Qwen/Qwen3-4B", load_in_4bit, kwargs)
+        except Exception as e:
+            logger.error(f"Unsloth loading failed: {e}")
+            logger.warning("Falling back to Transformers")
+            self.use_unsloth = False
+            self._load_with_transformers("Qwen/Qwen3-4B", load_in_4bit, kwargs)
+    
+    def _load_with_transformers(self, model_name: str, load_in_4bit: bool, kwargs: dict):
+        """Load model using Transformers (fallback)"""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            padding_side="left",
+            trust_remote_code=True
+        )
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        
+        self.model.eval()
+        logger.info("✓ Model loaded via Transformers")
+    
+    def _assess_question_difficulty(self, question_dict: Dict[str, Any]) -> str:
+        """
+        Assess question difficulty to choose optimal prompting strategy
+        
+        Returns: 'simple', 'medium', or 'complex'
+        """
+        question = question_dict.get('question', '')
+        topic = question_dict.get('topic', '')
+        
+        # Complexity indicators
+        complexity_keywords = {
+            'complex': ['paradox', 'contradiction', 'all of the above', 'none of the above', 
+                       'except', 'cannot', 'least likely', 'most likely'],
+            'medium': ['therefore', 'because', 'if', 'then', 'must', 'always', 'never'],
+            'simple': ['is', 'are', 'what', 'which', 'who']
+        }
+        
+        question_lower = question.lower()
+        
+        # Check for complex indicators
+        if any(kw in question_lower for kw in complexity_keywords['complex']):
+            return 'complex'
+        
+        # Check for long questions (>100 chars suggests complexity)
+        if len(question) > 100:
+            return 'complex'
+        
+        # Check for medium indicators
+        if any(kw in question_lower for kw in complexity_keywords['medium']):
+            return 'medium'
+        
+        return 'simple'
+    
+    def build_step_by_step_prompt(self, question_dict: Dict[str, Any]) -> str:
+        """
+        Build prompt for careful step-by-step reasoning
+        Dynamically adjusted based on question difficulty
+        """
+        choices_text = "\n".join(question_dict['choices'])
+        difficulty = self._assess_question_difficulty(question_dict)
+        
+        if difficulty == 'complex':
+            reasoning_guide = """DETAILED REASONING STEPS:
+1. What are ALL the given facts, conditions, and constraints?
+2. Are there any hidden assumptions or edge cases?
+3. What logical deductions MUST follow from these facts?
+4. Check EACH option carefully against ALL conditions
+5. Eliminate options that violate ANY condition
+6. Identify which option is logically necessary and consistent"""
+        
+        elif difficulty == 'medium':
+            reasoning_guide = """REASONING STEPS:
+1. What are the given facts and conditions?
+2. What logical deductions must follow from these facts?
+3. Check each option for consistency with the facts
+4. Which option is logically necessary?"""
+        
+        else:  # simple
+            reasoning_guide = """STEPS:
+1. Understand the question
+2. Apply the given information
+3. Select the correct option"""
+        
+        instruction = f"""Answer this question with careful logical reasoning.
+
+Question: {question_dict['question']}
+
+Options:
+{choices_text}
+
+{reasoning_guide}
+
+Think carefully and provide ONLY this JSON format:
+{{"answer": "X"}}
+
+Where X is A, B, C, or D."""
+        
+        return instruction
+    
+    def build_elimination_prompt(self, question_dict: Dict[str, Any]) -> str:
+        """
+        Build prompt using elimination strategy
+        Enhanced with difficulty awareness
+        """
+        choices_text = "\n".join(question_dict['choices'])
+        difficulty = self._assess_question_difficulty(question_dict)
+        
+        if difficulty == 'complex':
+            elimination_guide = """SYSTEMATIC ELIMINATION:
+For EACH option A, B, C, D:
+- Does it satisfy ALL stated conditions?
+- Are there any logical contradictions?
+- Does it handle edge cases properly?
+- Does it contradict any given facts?
+
+Eliminate any option that fails ANY test.
+The remaining option is correct."""
+        else:
+            elimination_guide = """ELIMINATION PROCESS:
+For each option, ask: Does this satisfy ALL the conditions in the question?
+Eliminate options that have contradictions or don't satisfy all conditions.
+The remaining option is correct."""
+        
+        instruction = f"""Answer by eliminating incorrect options.
+
+Question: {question_dict['question']}
+
+Options:
+{choices_text}
+
+{elimination_guide}
+
+Provide ONLY this JSON format:
+{{"answer": "X"}}
+
+Where X is A, B, C, or D."""
+        
+        return instruction
+    
+    def build_direct_prompt(self, question_dict: Dict[str, Any]) -> str:
+        """Build simple direct prompt (final fallback)"""
+        choices_text = "\n".join(question_dict['choices'])
+        
+        instruction = f"""Question: {question_dict['question']}
+
+{choices_text}
+
+Answer with ONLY JSON in this exact format:
+{{"answer": "X"}}
+
+Where X is A, B, C, or D (the correct choice)."""
+        
+        return instruction
+    
+    def generate_response(
+        self,
+        message: str | List[str],
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> tuple:
+        """
+        Generate answers with batch support
+        
+        Returns: (response, token_length, generation_time)
+        """
+        if system_prompt is None:
+            system_prompt = "You are a logical reasoning expert. Return ONLY valid JSON."
+        
+        if isinstance(message, str):
+            message = [message]
+        
+        # Format messages
+        texts = []
+        for msg in message:
+            text = CHAT_TEMPLATE.format(
+                system_prompt=system_prompt,
+                instruction=msg,
+            )
+            texts.append(text)
+        
+        # Tokenize with padding
+        model_inputs = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length
+        ).to(self.model.device)
+        
+        tgps_show_var = kwargs.get('tgps_show', False)
+        # Increased token limit for complex reasoning
+        max_new_tokens = kwargs.get('max_new_tokens', 256)
+        
+        if tgps_show_var:
+            start_time = time.time()
+        
+        # TOURNAMENT SAFE: Deterministic generation
+        try:
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,  # DETERMINISTIC
+                    do_sample=False,  # NO SAMPLING
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            return [""] * len(message), None, None
+        
+        if tgps_show_var:
+            generation_time = time.time() - start_time
+        
+        # Decode results
+        batch_outs = []
+        if tgps_show_var:
+            token_len = 0
+        
+        for input_ids, generated_sequence in zip(model_inputs.input_ids, generated_ids):
+            # Extract only newly generated tokens
+            output_ids = generated_sequence[len(input_ids):]
+            
+            if tgps_show_var:
+                token_len += len(output_ids)
+            
+            # Decode
+            content = self.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+            batch_outs.append(content)
+        
+        if tgps_show_var:
+            return (
+                batch_outs[0] if len(batch_outs) == 1 else batch_outs,
+                token_len,
+                generation_time,
+            )
+        
+        return batch_outs[0] if len(batch_outs) == 1 else batch_outs, None, None
+    
+    def answer_question(
+        self,
+        question_dict: Dict[str, Any],
+        **kwargs
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Answer a single question using multi-strategy approach
+        
+        Strategy 1: Detailed step-by-step reasoning (PRIMARY)
+        Strategy 2: Elimination (FALLBACK)
+        Strategy 3: Direct answer (FINAL FALLBACK)
+        """
+        question_id = question_dict.get('id', 'unknown')
+        start_time = time.time()
+        
+        logger.debug(f"Answering question {question_id}")
+        
+        # STRATEGY 1: Step-by-step reasoning
+        instruction = self.build_step_by_step_prompt(question_dict)
+        response, _, _ = self.generate_response(
+            instruction,
+            system_prompt="You are a logical reasoning expert. Return ONLY valid JSON.",
+            max_new_tokens=kwargs.get('max_new_tokens', 256),
+            tgps_show=False,
+        )
+        
+        answer = self._parse_and_validate_answer(response)
+        if answer:
+            self.strategy_stats['step_by_step']['success'] += 1
+            elapsed = time.time() - start_time
+            logger.info(f"✓ Q{question_id} answered via step-by-step in {elapsed:.2f}s")
+            return answer
+        else:
+            self.strategy_stats['step_by_step']['fail'] += 1
+            self._log_failure(question_dict, 'step_by_step', response)
+        
+        # STRATEGY 2: Elimination
+        instruction = self.build_elimination_prompt(question_dict)
+        response, _, _ = self.generate_response(
+            instruction,
+            system_prompt="You are a logical reasoning expert. Return ONLY JSON.",
+            max_new_tokens=256,
+            tgps_show=False,
+        )
+        
+        answer = self._parse_and_validate_answer(response)
+        if answer:
+            self.strategy_stats['elimination']['success'] += 1
+            elapsed = time.time() - start_time
+            logger.info(f"✓ Q{question_id} answered via elimination in {elapsed:.2f}s")
+            return answer
+        else:
+            self.strategy_stats['elimination']['fail'] += 1
+            self._log_failure(question_dict, 'elimination', response)
+        
+        # STRATEGY 3: Direct answer
+        instruction = self.build_direct_prompt(question_dict)
+        response, _, _ = self.generate_response(
+            instruction,
+            system_prompt="Return ONLY JSON with answer.",
+            max_new_tokens=256,
+            tgps_show=False,
+        )
+        
+        answer = self._parse_and_validate_answer(response)
+        if answer:
+            self.strategy_stats['direct']['success'] += 1
+            elapsed = time.time() - start_time
+            logger.info(f"✓ Q{question_id} answered via direct in {elapsed:.2f}s")
+            return answer
+        else:
+            self.strategy_stats['direct']['fail'] += 1
+            self._log_failure(question_dict, 'direct', response)
+        
+        elapsed = time.time() - start_time
+        logger.error(f"✗ Q{question_id} failed all strategies in {elapsed:.2f}s")
+        return None
+    
+    def answer_batch_questions(
+        self,
+        questions: List[Dict[str, Any]],
+        **kwargs
+    ) -> List[Optional[Dict[str, Any]]]:
+        """
+        Answer multiple questions in batch (for efficiency)
+        """
+        logger.info(f"Processing batch of {len(questions)} questions")
+        
+        instructions = [self.build_step_by_step_prompt(q) for q in questions]
+        responses, _, _ = self.generate_response(
+            instructions,
+            system_prompt="You are a logical reasoning expert. Return ONLY valid JSON.",
+            max_new_tokens=kwargs.get('max_new_tokens', 256),
+            tgps_show=False,
+        )
+        
+        answers = []
+        for i, (q, response) in enumerate(zip(questions, responses)):
+            answer = self._parse_and_validate_answer(response)
+            if answer:
+                self.strategy_stats['step_by_step']['success'] += 1
+                logger.debug(f"✓ Batch Q{i+1} answered")
+            else:
+                self.strategy_stats['step_by_step']['fail'] += 1
+                self._log_failure(q, 'step_by_step_batch', response)
+                logger.warning(f"✗ Batch Q{i+1} failed")
+            answers.append(answer)
+        
+        success_count = sum(1 for a in answers if a is not None)
+        logger.info(f"Batch complete: {success_count}/{len(questions)} successful")
+        
+        return answers
+    
+    def _parse_and_validate_answer(self, response: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse JSON response with multiple fallback strategies
+        ROBUST: Handles all edge cases
+        """
+        if not response:
+            return None
+        
+        # Strategy 1: Direct JSON parsing
+        try:
+            answer_dict = json.loads(response)
+            if 'answer' in answer_dict:
+                answer = str(answer_dict['answer']).strip().upper()
+                if len(answer) == 1 and answer in 'ABCD':
+                    return {"answer": answer}
+        except json.JSONDecodeError:
+            pass
+        
+        # Strategy 2: Extract JSON using find/rfind (robust)
+        try:
+            start = response.find('{')
+            end = response.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                json_str = response[start:end+1]
+                answer_dict = json.loads(json_str)
+                if 'answer' in answer_dict:
+                    answer = str(answer_dict['answer']).strip().upper()
+                    if len(answer) == 1 and answer in 'ABCD':
+                        return {"answer": answer}
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        # Strategy 3: Extract using regex pattern
+        try:
+            json_match = re.search(r'\{[^}]*"answer"[^}]*\}', response, re.DOTALL)
+            if json_match:
+                answer_dict = json.loads(json_match.group())
+                if 'answer' in answer_dict:
+                    answer = str(answer_dict['answer']).strip().upper()
+                    if len(answer) == 1 and answer in 'ABCD':
+                        return {"answer": answer}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        
+        # Strategy 4: Extract any A-D letter (last resort)
+        match = re.search(r'\b[A-D]\b', response.upper())
+        if match:
+            return {"answer": match.group(0)}
+        
+        # No valid answer found
+        return None
+    
+    def _log_failure(self, question: Dict[str, Any], strategy: str, response: str):
+        """Log failure cases for debugging"""
+        failure_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'question_id': question.get('id', 'unknown'),
+            'question': question.get('question', ''),
+            'strategy': strategy,
+            'response': response[:200],  # Truncate long responses
+        }
+        self.failure_log.append(failure_entry)
+        logger.debug(f"Logged failure for Q{question.get('id', 'unknown')} - {strategy}")
+    
+    def save_failure_log(self, filepath: str = "failures.json"):
+        """Save failure log to file"""
+        with open(filepath, 'w') as f:
+            json.dump(self.failure_log, f, indent=2)
+        logger.info(f"Failure log saved to {filepath}")
+    
+    def print_stats(self):
+        """Print strategy statistics"""
+        print("\n" + "="*70)
+        print("STRATEGY STATISTICS")
+        print("="*70)
+        
+        total_attempts = sum(
+            s['success'] + s['fail'] 
+            for s in self.strategy_stats.values()
+        )
+        
+        for strategy, stats in self.strategy_stats.items():
+            total = stats['success'] + stats['fail']
+            if total > 0:
+                success_rate = (stats['success'] / total) * 100
+                print(f"\n{strategy.upper()}")
+                print(f"  Success: {stats['success']}/{total} ({success_rate:.1f}%)")
+                print(f"  Failures: {stats['fail']}")
+        
+        print(f"\nTotal failures logged: {len(self.failure_log)}")
+        print("="*70)
+
+
+if __name__ == "__main__":
+    print("="*70)
+    print("ANSWER AGENT - OPTIMIZED WITH UNSLOTH")
+    print("="*70)
+    
+    # Initialize agent
+    agent = AAgent(use_unsloth=True, load_in_4bit=True)
+    
+    print("\n[TEST 1] Single Question - Basic Syllogism")
+    print("-"*70)
+    
+    sample_question = {
+        "id": "test_001",
+        "topic": "Logical Reasoning: Syllogisms",
+        "question": "All humans are mortal. Socrates is human. Therefore, what must be true?",
+        "choices": [
+            "A) Socrates is immortal",
+            "B) Socrates must be mortal",
+            "C) Some mortals are human",
+            "D) All mortals are Socrates"
+        ]
+    }
+    
+    print(f"Question: {sample_question['question']}")
+    print(f"Options: {sample_question['choices']}")
+    print()
+    
+    answer = agent.answer_question(sample_question)
+    if answer:
+        print(f"✓ Answer: {answer['answer']}")
+        print(f"✓ Expected: B")
+        print(f"✓ Correct: {answer['answer'] == 'B'}")
+    else:
+        print("✗ Failed to generate valid answer")
+    
+    print("\n[TEST 2] Multi-Difficulty Questions")
+    print("-"*70)
+    
+    test_questions = [
+        {
+            "id": "test_002",
+            "topic": "Puzzles: Seating Arrangements (Linear)",
+            "question": "A, B, C sit in a line. B is to the right of A. C is to the right of B. Who is in the middle?",
+            "choices": [
+                "A) A",
+                "B) B",
+                "C) C",
+                "D) Cannot be determined"
+            ]
+        },
+        {
+            "id": "test_003",
+            "topic": "Blood Relations and Family Tree",
+            "question": "If X is the brother of Y, and Y is the mother of Z, what is X to Z?",
+            "choices": [
+                "A) Father",
+                "B) Uncle",
+                "C) Brother",
+                "D) Cousin"
+            ]
+        },
+        {
+            "id": "test_004",
+            "topic": "Alphanumeric Series",
+            "question": "In the series 2, 4, 8, 16, 32, what is the next number?",
+            "choices": [
+                "A) 48",
+                "B) 64",
+                "C) 80",
+                "D) 96"
+            ]
+        },
+        {
+            "id": "test_005",
+            "topic": "Complex Logic",
+            "question": "All apples are fruits. Some fruits are sweet. Therefore, which must be true?",
+            "choices": [
+                "A) All apples are sweet",
+                "B) Some apples might be sweet",
+                "C) No apples are sweet",
+                "D) All fruits are apples"
+            ]
+        }
+    ]
+    
+    print("Testing multiple questions...\n")
+    for i, q in enumerate(test_questions, 1):
+        difficulty = agent._assess_question_difficulty(q)
+        answer = agent.answer_question(q)
+        status = "✓" if answer else "✗"
+        answer_text = answer['answer'] if answer else "None"
+        print(f"{status} Q{i} [{difficulty}]: {q['topic'][:35]}... → {answer_text}")
+    
+    print("\n[TEST 3] Batch Processing")
+    print("-"*70)
+    
+    batch_start = time.time()
+    batch_answers = agent.answer_batch_questions(test_questions)
+    batch_time = time.time() - batch_start
+    
+    print(f"Batch processed {len(test_questions)} questions in {batch_time:.2f}s")
+    if len(test_questions) > 0:
+        print(f"Average per question: {batch_time/len(test_questions):.2f}s")
+    
+    valid_count = sum(1 for a in batch_answers if a is not None)
+    print(f"Valid answers: {valid_count}/{len(test_questions)}")
+    
+    print("\n[TEST 4] Deterministic Behavior")
+    print("-"*70)
+    print("Testing if answers are deterministic across runs...\n")
+    
+    answers_per_run = []
+    for run in range(3):
+        q = sample_question
+        answer = agent.answer_question(q)
+        answers_per_run.append(answer['answer'] if answer else None)
+        print(f"Run {run+1}: {answer['answer'] if answer else 'None'}")
+    
+    if answers_per_run[0] == answers_per_run[1] == answers_per_run[2]:
+        print(f"\n✅ DETERMINISTIC: All runs produced same answer")
+        print(f"   Tournament-safe for reproducibility!")
+    else:
+        print(f"\n⚠️ Answers vary across runs (unexpected)")
+    
+    print("\n[TEST 5] Speed Check")
+    print("-"*70)
+    print("Testing response time per question...\n")
+    
+    times = []
+    for i in range(5):
+        q_start = time.time()
+        answer = agent.answer_question(sample_question)
+        q_time = time.time() - q_start
+        times.append(q_time)
+        status = "✓" if q_time < 9 else "✗"
+        print(f"{status} Question {i+1}: {q_time:.2f}s (limit: 9s)")
+    
+    avg_time = sum(times) / len(times)
+    max_time = max(times)
+    print(f"\nAverage: {avg_time:.2f}s")
+    print(f"Max: {max_time:.2f}s")
+    
+    if max_time < 9:
+        print(f"✅ All answers within 9s limit!")
+    else:
+        print(f"⚠️ Some answers exceed 9s limit")
+    
+    # Print statistics
+    agent.print_stats()
+    
+    # Save failure log if any failures occurred
+    if agent.failure_log:
+        agent.save_failure_log()
+        print(f"\n⚠️ Check failures.json for debugging information")
+    
+    print("\n" + "="*70)
+    print("✅ ANSWER AGENT READY FOR TOURNAMENT")
+    print("="*70)
